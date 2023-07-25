@@ -48,11 +48,11 @@ while let Some(block) = block_subscription.next().await {
 Relevant parts:
 
 1. the first line initializes a mutable block subscription from the provider.
-   1a. the `mut` keywork signifies that `block_subscription` is mutable, which is necessary here since the `next()` method changes the state of the subscription, i.e., moving to the next block
-   1b. the `?` operator is used for error handling, it will return the error upstream if one occurs during the await operation
+   - the `mut` keywork signifies that `block_subscription` is mutable, which is necessary here since the `next()` method changes the state of the subscription, i.e., moving to the next block
+   - the `?` operator is used for error handling, it will return the error upstream if one occurs during the await operation
 2. the second line loops as long as there's a new block, retrieving them asynchronously
 3. the third line prints the block number to the console
-   3a. the `!` near `println` makes it a macro, not a function. Macros in Rust are expanded at compile time into code, providing more flexibility than functions.
+   - the `!` near `println` makes it a macro, not a function. Macros in Rust are expanded at compile time into code, providing more flexibility than functions.
 
 Similarly, in `mev_share_client`:
 
