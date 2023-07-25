@@ -2,11 +2,11 @@
 
 Client library for MEV-Share written in Rust.
 
-Based on [MEV-Share Spec](https://github.com/flashbots/mev-share).
+Based on [MEV-Share Spec](https://github.com/flashbots/mev-share) and the [TypeScript reference implementation](https://github.com/flashbots/mev-share-client-ts).
 
 ## Progress
 
-Mostly done. ETA for getting to feature parity with TS repo is July, 26th.
+Mostly done. ETA for getting to feature parity with TS reference implementation is July, 26th.
 
 Here's the current state:
 
