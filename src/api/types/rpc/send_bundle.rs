@@ -1,127 +1,44 @@
-use derive_builder::{Builder, UninitializedFieldError};
 use ethers::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use typed_builder::TypedBuilder;
 
-// Technically part of `simulation` but deserves it's own file because of how many sub-structs it has.
-
-/// Parameters sent to [`mev_sendBundle`].
-#[derive(Clone, Serialize, Debug)]
+/// Parameters for RPC `mev_sendBundle` requests. See [`crate::MevShareClient::send_bundle`].
+#[derive(Clone, Serialize, Deserialize, Debug, Default, TypedBuilder)]
 #[serde(rename_all = "camelCase")]
-pub struct SendBundleParams {
+pub struct SendBundleParams<'lt> {
     /// Smart bundle spec version
-    pub version: String,
+    #[builder(default = "v0.1")]
+    pub version: &'lt str,
+
     /// Conditions for the bundle to be considered for inclusion in a block, evaluated _before_ the bundle is placed in a block
+    #[builder(setter(transform = |block: U64, max_block: Option<U64>|  Inclusion { block, max_block }))]
     pub inclusion: Inclusion,
-    /// Transactions that make up the bundle. `hash` refers to a transaction hash from the Matchmaker event stream
-    pub body: Vec<Body>,
+
+    /// Transactions that make up the bundle. `hash` refers to a transaction hash from the MevShare event stream
+    pub body: Vec<Body<'lt>>,
+
     /// Conditions for bundle to be considered for inclusion in a block, evaluated _after_ the bundle is placed in the block
+    #[builder(default, setter(transform = |refund: Vec<Refund>, refund_config: Vec<RefundConfig>| Some(Validity { refund, refund_config })))]
     pub validity: Option<Validity>,
-    pub privacy: Option<Privacy>,
-    pub metadata: Option<Metadata>,
+
+    /// Privacy settings. See [`Hint`] and [`Builder`] for more info.
+    #[builder(default, setter(transform = |hints: Option<HashSet<Hint>>, builders: Option<HashSet<Builder<'lt>>>| Some(Privacy { hints, builders })))]
+    pub privacy: Option<Privacy<'lt>>,
+
+    #[builder(default, setter(transform = |origin_id: &'lt str| Some(Metadata { origin_id: Some(origin_id) })))]
+    pub metadata: Option<Metadata<'lt>>,
 }
 
-#[derive(Default, Debug, Clone)]
-pub struct SendBundleParamsBuilder {
-    /// Smart bundle spec version
-    version: Option<String>,
-    /// Conditions for the bundle to be considered for inclusion in a block, evaluated _before_ the bundle is placed in a block
-    inclusion: Option<Inclusion>,
-    /// Transactions that make up the bundle. `hash` refers to a transaction hash from the Matchmaker event stream
-    body: Option<Vec<Body>>,
-    /// Conditions for bundle to be considered for inclusion in a block, evaluated _after_ the bundle is placed in the block
-    validity: Option<Option<Validity>>,
-    privacy: Option<Option<Privacy>>,
-    metadata: Option<Option<Metadata>>,
+/// Response for RPC `mev_sendBundle` requests. See [`crate::MevShareClient::send_bundle`].
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SendBundleResponse {
+    pub bundle_hash: TxHash,
 }
 
-impl SendBundleParamsBuilder {
-    pub fn version(mut self, version: String) -> Self {
-        self.version = Some(version);
-        self
-    }
-
-    pub fn inclusion_block(mut self, block: U64) -> Self {
-        self.inclusion.get_or_insert_with(Default::default).block = block;
-        self
-    }
-
-    pub fn inclusion_max_block(mut self, max_block: U64) -> Self {
-        self.inclusion
-            .get_or_insert_with(Default::default)
-            .max_block = Some(max_block);
-        self
-    }
-
-    #[must_use]
-    pub fn body(mut self, body: Vec<Body>) -> Self {
-        self.body = Some(body);
-        self
-    }
-
-    pub fn validitiy_refund(mut self, refund: Vec<Refund>) -> Self {
-        self.validity
-            .get_or_insert_with(|| Some(Default::default()))
-            .as_mut()
-            .unwrap()
-            .refund = refund;
-        self
-    }
-
-    pub fn validitiy_refund_config(mut self, refund_config: Vec<RefundConfig>) -> Self {
-        self.validity
-            .get_or_insert_with(|| Some(Default::default()))
-            .as_mut()
-            .unwrap()
-            .refund_config = refund_config;
-        self
-    }
-
-    pub fn privacy_hints(mut self, hints: HashSet<HintPreference>) -> Self {
-        self.privacy
-            .get_or_insert_with(|| Some(Default::default()))
-            .as_mut()
-            .unwrap()
-            .hints = Some(hints);
-        self
-    }
-
-    pub fn privacy_builders(mut self, builders: Vec<String>) -> Self {
-        self.privacy
-            .get_or_insert_with(|| Some(Default::default()))
-            .as_mut()
-            .unwrap()
-            .builders = Some(builders);
-        self
-    }
-
-    pub fn metadata_origin_id(mut self, origin_id: String) -> Self {
-        self.metadata
-            .get_or_insert_with(|| Some(Default::default()))
-            .as_mut()
-            .unwrap()
-            .origin_id = Some(origin_id);
-        self
-    }
-
-    pub fn build(self) -> std::result::Result<SendBundleParams, UninitializedFieldError> {
-        Ok(SendBundleParams {
-            version: self.version.unwrap_or("v0.1".to_string()),
-            inclusion: self
-                .inclusion
-                .ok_or_else(|| UninitializedFieldError::new("inclusion"))?,
-            body: self
-                .body
-                .ok_or_else(|| UninitializedFieldError::new("body"))?,
-            validity: self.validity.unwrap_or_default(),
-            privacy: self.privacy.unwrap_or_default(),
-            metadata: self.metadata.unwrap_or_default(),
-        })
-    }
-}
-
-/// Conditions for bundle to be considered for inclusion in a block, evaluated _after_ the bundle is placed in the block.
-#[derive(Clone, Serialize, Default, Debug)]
+/// See [`SendBundleParams::validity`].
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Validity {
     /// Conditions for receiving refunds (MEV kickbacks)
@@ -130,8 +47,8 @@ pub struct Validity {
     pub refund_config: Vec<RefundConfig>,
 }
 
-/// Conditions for receiving refunds (MEV kickbacks).
-#[derive(Clone, Serialize, Default, Debug)]
+/// See [`Validity::refund`].
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Refund {
     /// Index of entry in `body` to which the refund percentage applies.
@@ -140,20 +57,58 @@ pub struct Refund {
     pub percent: u32,
 }
 
-/// Privacy settings for the submitted bundle.
-#[derive(Clone, Serialize, Default, Debug)]
-pub struct Privacy {
-    pub hints: Option<HashSet<HintPreference>>,
-    pub builders: Option<Vec<String>>,
+/// See [`SendBundleParams::privacy`].
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
+pub struct Privacy<'lt> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<HashSet<Hint>>,
+    #[serde(skip_serializing_if = "Option::is_none", borrow)]
+    pub builders: Option<HashSet<Builder<'lt>>>,
 }
 
-#[derive(Clone, Serialize, Default, Debug)]
+/// List of builders to share transactions/bundles with that are currently [supported by Flashbots].
+///
+/// ## Usage:
+///
+/// ```
+/// let bundle = BundleParams::builder()
+///     ...
+///     .privacy(/* hints */, Some(set![
+///         Builder::Flashbots,
+///         Builder::Rsync,
+///         Builder::Other("a non-flashbots builder")
+///     ])
+///     .build();
+/// ```
+///
+/// [supported by Flashbots]: https://docs.flashbots.net/flashbots-auction/searchers/advanced/rpc-endpoint#mev_sendbundle
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Builder<'lt> {
+    Default,
+    Flashbots,
+    Rsync,
+    #[serde(rename = "beaverbuild.org")]
+    BeaverBuild,
+    Builder0x69,
+    #[serde(rename = "Titan")]
+    Titan,
+    #[serde(rename = "EigenPhi")]
+    EigenPhi,
+    #[serde(rename = "boba-builder")]
+    BobaBuilder,
+    Other(&'lt str),
+}
+
+/// See [`SendBundleParams::metadata`].
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct Metadata {
-    pub origin_id: Option<String>,
+pub struct Metadata<'lt> {
+    pub origin_id: Option<&'lt str>,
 }
 
-#[derive(Clone, Serialize, Default, Debug)]
+/// See [`SendBundleParams::inclusion`].
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Inclusion {
     /// Target block number in which to include the bundle.
@@ -162,8 +117,8 @@ pub struct Inclusion {
     pub max_block: Option<U64>,
 }
 
-/// Specifies how refund should be paid if bundle is used by another searcher.
-#[derive(Clone, Serialize, Default, Debug)]
+/// See [`Validity::refund_config`].
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RefundConfig {
     /// The address that receives this portion of the refund.
@@ -174,19 +129,27 @@ pub struct RefundConfig {
 }
 
 /// Transactions that make up the bundle.
-/// `hash` refers to a transaction hash from the Matchmaker event stream.
-#[derive(Clone, Serialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase", untagged)]
-pub enum Body {
-    Hash(TxHash),
-    Signed { tx: Bytes, can_revert: bool },
-    Bundle(Box<SendBundleParams>),
+pub enum Body<'lt> {
+    // A transaction hash from the MEV-Share event stream.
+    Tx {
+        hash: TxHash,
+    },
+    // A signed transaction.
+    Signed {
+        tx: Bytes,
+        can_revert: bool,
+    },
+    // A nested bundle
+    #[serde(borrow)]
+    Bundle(Box<SendBundleParams<'lt>>),
 }
 
 /// Privacy settings for the submitted bundle.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 #[serde(rename_all = "snake_case")]
-pub enum HintPreference {
+pub enum Hint {
     /// Share the calldata of the transaction.
     Calldata,
     /// Share the contract address of the transaction.
@@ -195,28 +158,9 @@ pub enum HintPreference {
     FunctionSelector,
     /// Share the logs emitted by the transaction.
     Logs,
-    /// Share tx hashes of transactions in bundle.
+    /// Share tx hashes of the transactions in the bundle.
     TxHash,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct SendBundleResponse {
-    pub bundle_hash: TxHash,
-}
-
-/// Parameters accepted by the [`send_transaction`] function.
-#[derive(Clone, Builder, Default, Debug, Serialize)]
-#[builder(
-    default,
-    setter(strip_option),
-    build_fn(error = "UninitializedFieldError")
-)]
-#[serde(rename_all = "camelCase")]
-pub struct TransactionParams {
-    /// Maximum block number for the transaction to be included in.
-    pub max_block_number: Option<U64>,
-    /// Hints define what data about a transaction is shared with searchers.
-    pub hints: Option<HashSet<HintPreference>>,
-    pub builders: Option<Vec<Address>>,
+    TransactionHash,
+    /// Share the hash of the bundle/transaction being sent.
+    Hash,
 }

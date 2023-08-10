@@ -1,14 +1,13 @@
-use derive_builder::{Builder, UninitializedFieldError};
 use ethers::prelude::*;
 use serde::{Deserialize, Serialize};
+use typed_builder::TypedBuilder;
 
-/// Optional fields to override simulation state.
-#[derive(Serialize, Clone, Default, Builder, Debug)]
-#[builder(
-    default,
-    setter(strip_option),
-    build_fn(error = "UninitializedFieldError")
-)]
+/// MEV-Share API parameters for RPC `mev_simBundle` requests:
+/// optional fields to override simulation state
+///
+/// See [`crate::MevShareClient::simulate_bundle`].
+#[derive(Serialize, Clone, Default, TypedBuilder, Debug)]
+#[builder(field_defaults(default, setter(strip_option)))]
 #[serde(rename_all = "camelCase")]
 pub struct SimulateBundleParams {
     /// Block used for simulation state. Defaults to latest block.
@@ -30,7 +29,10 @@ pub struct SimulateBundleParams {
     pub timeout: Option<u64>,
 }
 
-/// Simulation details.
+/// MEV-Share API response for RPC `mev_simBundle` requests:
+/// simulation details.
+/// .
+/// See [`crate::MevShareClient::simulate_bundle`].
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SimulateBundleResponse {
@@ -41,13 +43,13 @@ pub struct SimulateBundleResponse {
     pub profit: U256,
     pub refundable_value: U256,
     pub gas_used: U256,
-    pub logs: Option<Vec<BundleLogs>>,
+    pub logs: Vec<BundleLogs>,
 }
 
-/// Logs returned by `mev_simBundle`.
+/// See [`SimulateBundleResponse::logs`].
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct BundleLogs {
-    pub tx_logs: Option<Vec<Log>>, // TODO: Is this actually ethers::Log?
+    pub tx_logs: Option<Vec<Log>>,
     pub bundle_logs: Option<Vec<BundleLogs>>,
 }

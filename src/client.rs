@@ -1,194 +1,142 @@
-use crate::api::networks::{MevShareNetwork, Network};
+use crate::api::networks::MevShareNetwork;
+use crate::api::rest_client::RestClient;
+use crate::api::rpc_client::MevShareRpcClient;
+use crate::api::types::PendingTransaction;
 use crate::api::types::*;
-use crate::error::{Error, Result};
-use crate::provider::FromEnv;
-use crate::{SendBundleParams, TransactionParams};
+use crate::error::JsonError;
+use crate::helpers::provider::Waiter;
+use crate::{Result, SendBundleParams, SendTransactionParams};
 use ethers::prelude::*;
-use ethers::utils::keccak256;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use reqwest_eventsource::{Event, EventSource};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 use serde_json::json;
-use std::time::{Duration, Instant};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
+use tracing::trace;
 
-/// How long to wait for target to appear onchain, when calling mev_simBundle on a tx specified bundle.
-const TIMEOUT_QUERY_TX_MS: Duration = Duration::from_secs(5 * 60);
-
-pub enum MevShareRequest {
-    SendPrivateTransaction,
-    SendBundle,
-    SimBundle,
-}
-
-impl MevShareRequest {
-    pub fn as_method_name(&self) -> &str {
-        match &self {
-            Self::SendPrivateTransaction => "eth_sendPrivateTransaction",
-            Self::SendBundle => "mev_sendBundle",
-            Self::SimBundle => "mev_simBundle",
-        }
-    }
-}
-
-pub struct MevShareClient {
-    auth_wallet: LocalWallet,
+pub struct MevShareClient<'a> {
+    provider: Provider<Ws>,
     network: MevShareNetwork,
-    http: reqwest::Client,
+    rpc: MevShareRpcClient<'a>,
+    rest: RestClient,
 }
 
-impl MevShareClient {
-    pub fn new(auth_wallet: LocalWallet, network: Network) -> Self {
-        Self {
-            auth_wallet,
-            network: network.into(),
-            http: reqwest::Client::new(),
-        }
+impl MevShareClient<'_> {
+    /// Initializes a [`MevShareClient`].
+    ///
+    /// If you already have a `chain_id`, you can use [`Self::new_with_chain_id`], which is not async because it avoids the network trip.
+    /// `chain_id` is needed to infer which MEV-Share endpoint (e.g. mainnet or goerli) to query.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let client = MevShareClient::new(auth_wallet. provider).await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::Error::Provider`] if the `provider` fails to retrieve a `chain_id`.
+    /// * [`crate::Error::UnsupportedNetwork`] if the `chain_id` is not supported by the MEV-Share client.
+    pub async fn new(auth_wallet: LocalWallet, provider: Provider<Ws>) -> Result<Self> {
+        let chain_id = provider.get_chainid().await?;
+        Self::new_with_chain_id(auth_wallet, provider, chain_id)
     }
 
-    /// Sends a POST request to the Matchmaker API and returns the data.
+    /// Initializes a [`MevShareClient`].
     ///
-    /// # Arguments
+    /// # Example
     ///
-    /// * `method` - JSON-RPC method
-    /// * `params` - JSON-RPC params
+    /// ```
+    /// // no need to await here
+    /// let client = MevShareProvider::new_with_chain_id(auth_wallte, provider, chain_id)?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::Error::UnsupportedNetwork`] if the `chain_id` is not supported by the MEV-Share client.
+    pub fn new_with_chain_id(
+        auth_wallet: LocalWallet,
+        provider: Provider<Ws>,
+        chain_id: U256,
+    ) -> Result<Self> {
+        let network = MevShareNetwork::try_from(chain_id)?;
+        let rest_url = format!("{}/api/v1", network.stream_url.trim_end_matches('/'));
+
+        Ok(Self {
+            rpc: MevShareRpcClient::new(network.api_url, auth_wallet),
+            rest: RestClient::new(rest_url),
+            provider,
+            network,
+        })
+    }
+
+    /// Starts listening to the MEV-Share event stream.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let block_stream = client.subscribe_bundles();
+    /// while let Some(block) = block_stream.next().await {
+    ///     println!("received new block {:?}", block);
+    /// }
+    /// ```
     ///
     /// # Returns
     ///
-    /// Response data from the API request.
-    pub async fn post_rpc<T, P>(&self, method: MevShareRequest, params: P) -> Result<T>
-    where
-        P: Serialize,
-        T: DeserializeOwned,
-    {
-        let body = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: 69,
-            method: method.as_method_name().to_string(),
-            params: serde_json::to_value(params)?,
-        };
-
-        tracing::debug!(request = ?body);
-
-        let signature = format!(
-            "{:?}:0x{}",
-            self.auth_wallet.address(),
-            self.auth_wallet
-                .sign_message(format!(
-                    "0x{}",
-                    ethers::utils::hex::encode(keccak256(serde_json::to_string(&body)?.as_bytes()))
-                ))
-                .await?
-        );
-
-        let headers = {
-            let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            headers.insert(
-                "X-Flashbots-Signature",
-                HeaderValue::from_str(&signature).unwrap(),
-            );
-            headers
-        };
-
-        let response: String = self
-            .http
-            .post(self.network.api_url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?
-            .text()
-            .await?;
-
-        tracing::debug!(%response);
-
-        let response = serde_json::from_str::<JsonRpcResponse<T>>(&response).map_err(|error| {
-            crate::Error::Deserialization {
-                error,
-                text: response,
-            }
-        })?;
-
-        match response {
-            JsonRpcResponse::Error(err) => Err(Error::JsonRpc(err)),
-            JsonRpcResponse::Success(data) => Ok(data.result),
-        }
-    }
-
-    /// Make an HTTP GET request.
-    ///
-    /// # Arguments
-    ///
-    /// * `url_suffix` - URL to send the request to.
-    async fn stream_get<T>(&self, url_suffix: &str) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        let url = format!(
-            "{}/api/v1/{url_suffix}",
-            self.network.stream_url.trim_end_matches('/')
-        );
-
-        let response: String = reqwest::get(url).await?.text().await?;
-        let response: StreamResponse<T> =
-            serde_json::from_str(&response).map_err(|error| crate::Error::Deserialization {
-                error,
-                text: response,
-            })?;
-
-        Ok(response.data)
-    }
-
-    /// Starts listening to the Matchmaker event stream.
-    ///
-    /// # Arguments
-    ///
-    /// * `event_type` - The [`StreamEvent`] listen for. Options specified by [`StreamEvent`] enum.
-    ///
-    /// # Returns
-    ///
-    ///  Stream with the [`EventPayload`].
-    pub fn subscribe(
-        &self,
-        event_type: EventType,
-    ) -> impl Stream<Item = Result<EventPayload>> + '_ {
-        let event_source = EventSource::get(self.network.stream_url);
-        let event_type = serde_json::to_string(&event_type).unwrap();
-
-        Box::pin(event_source.filter_map(move |event| {
-            let event_type = event_type.clone();
-
-            async move {
-                match event {
+    ///  A stream of [`MevShareEvent`]s.
+    pub fn subscribe_bundles(&self) -> impl Stream<Item = Result<MevShareEvent>> + '_ {
+        EventSource::get(self.network.stream_url).filter_map(move |event| match event {
                     Ok(Event::Open) => None,
                     Ok(Event::Message(msg)) => {
-                        if msg.event != event_type {
-                            return None;
-                        }
+                trace!(%msg.data);
 
-                        let payload_received: MevShareEvent =
-                            serde_json::from_str(&msg.data).unwrap();
-
-                        match msg.event.as_str() {
-                            "bundle" => Some(Ok(EventPayload::Bundle(payload_received))),
-                            "transaction" => {
-                                Some(Ok(EventPayload::Transaction(payload_received.into())))
-                            }
-                            other_event => {
-                                tracing::warn!("Unhandled event: {other_event}");
-                                None
-                            }
-                        }
-                    }
-                    Err(err) => Some(Err(err.into())),
-                }
+                Some(
+                    serde_json::from_str(&msg.data)
+                        .map_err(|source| JsonError::Deserialization {
+                            text: msg.data,
+                            source,
+                        })
+                        .map_err(Into::into),
+                )
             }
-        }))
+            Err(err) => Some(Err(err.into())),
+        })
     }
 
-    /// Sends a private transaction with MEV hints to the Flashbots Matchmaker.
+    /// Sends a private transaction with MEV hints to Flashbots MEV-Share.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let client = MevShareClient::new(auth_wallet, provider).await?;
+    ///
+    /// // compose a tx
+    /// let tx: TypedTransaction = Eip1559TransactionRequest::default()
+    ///     .chain_id(chain_id.as_u64())
+    ///     .from(sender_wallet.address())
+    ///     .to(sender_wallet.address())
+    ///     .gas(22_000)
+    ///     .data(b"i'm shariiiing")
+    ///     .max_fee_per_gas(fee_data.0 * 110 / 100)
+    ///     .max_priority_fee_per_gas(fee_data.1 * 110 / 100)
+    ///     .into();
+    ///
+    /// // specify the `eth_sendPrivateTransaction` params
+    /// let private_tx = SendTransactionParams::builder()
+    ///     .tx(tx.rlp_signed(&sender_wallet.sign_transaction_sync(&tx)?))
+    ///     .max_block_number(current_block + 20)
+    ///     .preferences(
+    ///         Some(set![Hint::Hash, Calldata, Logs, ContractAddress, FunctionSelector]),
+    ///         Some(set![Builder::Flashbots]),
+    ///     )
+    ///     .build();
+    ///
+    /// debug!(?private_tx, "sending private tx to Flashbots MEV-Share API");
+    ///
+    /// let pending_tx = client.send_private_transaction(private_tx.clone()).await?;
+    /// debug!(?pending_tx.hash, "relayer accepted the transaction");
+    ///
+    /// let (_receipt, block) = pending_tx.inclusion().await?;
+    /// debug!(?pending_tx.hash, "the transaction has been included in block={block}");
+    /// ```
     ///
     /// # Arguments
     ///
@@ -198,29 +146,67 @@ impl MevShareClient {
     /// # Returns
     ///
     /// Transaction hash.
-    pub async fn send_transaction(
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::Error::Rpc`] if the network request to the MEV-Share API fails.
+    /// * [`crate::Error::Provider`] if `self.provider` fails to get the [`TransactionReceipt`] or subscribing to blocks to wait for it.
+    /// * [`crate::Error::TransactionTimeout`] if the transaction is not included in a block before `params.max_block_number` or 25[^1] blocks.
+    /// * [`crate::Error::TransactionRevert`] if the transaction reverts.
+    ///
+    /// [^1]: See [flashbots docs](https://docs.flashbots.net/flashbots-auction/searchers/advanced/private-transaction).
+    pub async fn send_private_transaction(
         &self,
-        signed_tx: Bytes,
-        options: TransactionParams,
-    ) -> Result<TxHash> {
-        let tx_params = json!({
-            "tx": signed_tx,
-            "maxBlockNumber": options.max_block_number,
-            "preferences": {
-                "fast": true, // deprecated but required; setting has no effect
-                // privacy uses default (Stable) config if no hints specified
-                "privacy": {
-                    "hints": options.hints,
-                    "builders": options.builders, // WARN: It's not where it's in the TS library, but seems to be good like this according to the docs https://docs.flashbots.net/flashbots-auction/searchers/advanced/rpc-endpoint#eth_sendprivatetransaction
-                },
-            }
-        });
+        params: SendTransactionParams<'_>,
+    ) -> Result<PendingTransaction> {
+        let max_block_number = params.max_block_number;
 
-        self.post_rpc(MevShareRequest::SendPrivateTransaction, [tx_params])
-            .await
+        let hash: TxHash = self
+            .rpc
+            .post(MevShareRequest::SendPrivateTransaction, [params])
+            .await?;
+
+        Ok(PendingTransaction::new(
+            hash,
+            max_block_number,
+            &self.provider,
+        ))
     }
 
     /// Sends a bundle to mev-share.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use crate::prelude::*;
+    ///
+    /// let bundle_request = SendBundleParams::builder()
+    ///     .body(vec![
+    ///         Body::Signed {
+    ///             tx: MockTx::default().tip(tip).build().await?,
+    ///             can_revert: false,
+    ///         },
+    ///         Body::Signed {
+    ///             tx: MockTx::default().tip(tip).nonce_add(1).build().await?,
+    ///             can_revert: false,
+    ///         },
+    ///     ])
+    ///     .inclusion(current_block + 1, Some(current_block + 1 + 20))
+    ///     .privacy(
+    ///         Some(set![Hash, Calldata, Logs, FunctionSelector, ContractAddress]),
+    ///         Some(set![Flashbots, Builder::Custom("my own builder")]),
+    ///     )
+    ///     .build();
+    ///
+    /// // send the bundle to the Flashbots MEV-Share relayer
+    /// let pending_bundle = client.send_bundle(bundle_request).await?;
+    /// let bundle_hash = pending_bundle.hash;
+    /// info!(?bundle_hash, "bundle accepted by the relayer");
+    ///
+    /// // wait for the bundle to land
+    /// pending_bundle.inclusion().await?;
+    /// info!(?bundle_hash, "bundle landed on-chain");
+    /// ```
     ///
     /// # Arguments
     ///
@@ -229,8 +215,29 @@ impl MevShareClient {
     /// # Returns
     ///
     /// Array of bundle hashes.
-    pub async fn send_bundle(&self, params: SendBundleParams) -> Result<SendBundleResponse> {
-        self.post_rpc(MevShareRequest::SendBundle, [params]).await
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::Error::Rpc`] if the JSON-RPC request to the MEV-Share API fails.
+    /// * [`crate::Error::Provider`] if `self.provider` fails to get the [`TransactionReceipt`] for the transactions that or subscribing to blocks to wait for it.
+    /// * [`crate::Error::BundleTimeout`] if the bundle is not included in a block before `params.inclusion.max_block`.
+    /// * [`crate::Error::BundleRevert`] if any transaction in the bundle reverts.
+    /// * [`crate::Error::BundleDiscard`] if the bundle was not included as a whole but some of the transactions in its body were included
+    /// (before `params.inclusion.max_block`, otherwise [`crate::Error::BundleTimeout`] will be returned instead).
+    pub async fn send_bundle<'lt>(
+        &'lt self,
+        params: SendBundleParams<'lt>,
+    ) -> Result<PendingBundle> {
+        let send_bundle_response: SendBundleResponse = self
+            .rpc
+            .post(MevShareRequest::SendBundle, [params.clone()])
+            .await?;
+
+        Ok(PendingBundle::new(
+            send_bundle_response.bundle_hash,
+            params,
+            &self.provider,
+        ))
     }
 
     /// Simulates a bundle specified by `params`.
@@ -238,6 +245,24 @@ impl MevShareClient {
     /// Bundles containing pending transactions (specified by `{hash}` instead of `{tx}` in `params.body`) may
     /// only be simulated after those transactions have landed on chain. If the bundle contains
     /// pending transactions, this method will wait for the transactions to land before simulating.
+    ///
+    /// # Example
+    ///
+    /// ```
+    ///  let simulation_result = client
+    ///     .simulate_bundle(
+    ///         bundle_request.clone(),
+    ///         SimulateBundleParams::builder()
+    ///             .parent_block(current_block)
+    ///             .build(),
+    ///     )
+    ///     .await?;
+    ///
+    /// if !simulation_result.success {
+    ///     // do not send to avoid losing priority
+    ///     return Err(Error::SimulationFailure(simulation_result));
+    /// }
+    /// ```
     ///
     /// # Arguments
     ///
@@ -247,124 +272,148 @@ impl MevShareClient {
     /// # Returns
     ///
     /// Simulation result.
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::Error::Rpc`] if any JSON-RPC request to the MEV-Share API fails.
+    /// * [`crate::Error::Provider`] if the provider can't subscribe to the blocks to wait for the unsigned
+    /// transactions to land, or fetch the transactions.
+    ///
+    /// For a more comprehensive example, see [`crate::MevShareClient::send_bundle`].
     pub async fn simulate_bundle(
         &self,
-        bundle_params: SendBundleParams,
-        sim_options: SimulateBundleParams,
+        mut bundle_params: SendBundleParams<'_>,
+        mut sim_options: SimulateBundleParams,
     ) -> Result<SimulateBundleResponse> {
-        match bundle_params.body.first() {
-            // hash must appear onchain before simulation is possible
-            Some(Body::Hash(hash)) => self.sim_tx(*hash, bundle_params, sim_options).await,
-            _ => self.sim_bundle(bundle_params, sim_options).await,
-        }
-    }
+        if let Some(Body::Tx { hash }) = bundle_params.body.first() {
+            // hash must appear on-chain before simulation is possible
+            let (tx, block_number) = self
+                .provider
+                .wait_for_tx(*hash, bundle_params.inclusion.block + TX_WAIT_MAX_BLOCKS)
+                .await?;
 
-    /// Internal mev_simBundle call.
-    ///
-    /// Note: This may only be used on matched bundles.
-    /// Simulating unmatched bundles (i.e. bundles with a hash present) will throw an error.
-    ///
-    /// # Arguments
-    ///
-    /// * `params` - Parameters for the bundle
-    /// * `simOptions` - Simulation options; override block header data for simulation
-    ///
-    /// # Returns
-    ///
-    /// Simulation result.
-    async fn sim_bundle(
-        &self,
-        bundle_params: SendBundleParams,
-        sim_options: SimulateBundleParams,
-    ) -> Result<SimulateBundleResponse> {
-        self.post_rpc(
-            MevShareRequest::SimBundle,
-            json!([bundle_params, sim_options]),
-        )
-        .await
-    }
-
-    async fn sim_tx(
-        &self,
-        hash: TxHash,
-        bundle_params: SendBundleParams,
-        sim_options: SimulateBundleParams,
-    ) -> Result<SimulateBundleResponse> {
-        tracing::info!(
-            "Transaction hash: {hash} must appear onchain before simulation is possible, waiting"
-        );
-
-        let provider = Provider::from_env().await?;
-
-        let check_then_sim_tx = || async {
-            let tx = match provider.get_transaction(hash).await {
-                Ok(Some(tx)) => tx,
-                _ => return None, // not yet landed
-            };
-
-            let block_number = match tx.block_number {
-                Some(block_number) => block_number,
-                None => return None, // not yet landed
-            };
-
-            tracing::info!(
-                "Found transaction hash: {hash:?} onchain at block number: {block_number}, simulating",
-            );
-
-            let simulation_result = self
-                .sim_bundle(
-                    SendBundleParams {
-                        body: {
+            // replace hash with signed tx
                             let mut body = bundle_params.body.clone();
                             body[0] = Body::Signed {
                                 tx: tx.rlp(),
                                 can_revert: false,
                             };
-                            body
-                        },
+
+            bundle_params = SendBundleParams {
+                body,
                         ..bundle_params.clone()
-                    },
-                    SimulateBundleParams {
+            };
+
+            sim_options = SimulateBundleParams {
                         parent_block: sim_options.parent_block.or(Some(block_number - 1)),
                         ..sim_options.clone()
-                    },
-                )
-                .await;
-
-            Some(simulation_result)
         };
-
-        // in case tx is already landed
-        if let Some(result) = check_then_sim_tx().await {
-            return result;
         }
 
-        // check for `TIMEOUT_QUERY_TX_MS` millis
-        let start_time = Instant::now();
-
-        let mut block_subscription = provider.subscribe_blocks().await?;
-        while let Some(_block) = block_subscription.next().await {
-            if let Some(result) = check_then_sim_tx().await {
-                return result;
-            } else if Instant::now() - start_time > TIMEOUT_QUERY_TX_MS {
-                break;
-            }
-        }
-
-        Err(Error::TxTimeout(TIMEOUT_QUERY_TX_MS))
+        self.rpc
+            .post(
+                MevShareRequest::SimBundle,
+                json!([bundle_params, sim_options]),
+            )
+            .await
+            .map_err(Into::into)
     }
 
     /// Gets information about the event history endpoint.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let client = MevShareClient::new_with_chain_id(
+    ///     config.auth_wallet.clone(),
+    ///     config.provider.clone(),
+    ///     U256::one(), // EventHistory seems to be only supported on mainnet
+    /// )?;
+    /// let event_history_info = client.get_event_history_info().await?;
+    ///
+    /// let mut page = 0;
+    /// let mut done = false;
+    ///
+    /// while !done {
+    ///     let events = client
+    ///         .get_event_history(
+    ///             GetEventHistoryParams::builder()
+    ///                 .limit(event_history_info.max_limit)
+    ///                 .offset(page * event_history_info.max_limit)
+    ///                 .block_start(event_history_info.min_block)
+    ///                 .build(),
+    ///         )
+    ///         .await?;
+    ///
+    ///     for event in &events {
+    ///         if let Some(txs) = &event.hint.txs && !txs.is_empty() {
+    ///             debug!(?event);
+    ///             debug!(?txs);
+    ///             break;
+    ///         }
+    ///     }
+    ///
+    ///     for event in &events {
+    ///         if let Some(logs) = &event.hint.logs && !logs.is_empty() {
+    ///             debug!(?logs);
+    ///             done = true;
+    ///             break;
+    ///         }
+    ///     }
+    ///
+    ///     page += 1;
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::Error::Rest`] if the network GET request to the MEV-Share API fails.
     pub async fn get_event_history_info(&self) -> Result<EventHistoryInfo> {
-        self.stream_get("history/info").await
+        self.rest.get("history/info").await.map_err(Into::into)
     }
 
     /// Gets past events that were broadcast via the SSE event stream.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let info = client.get_event_history_info().await?;
+    /// pritnln!("min_block={}, max_limit={}", info.min_block, info.max_limit);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::Error::Rest`] if the network GET request to the MEV-Share API fails.
+    ///
+    /// For a more comprehensive example, see [`crate::MevShareClient::get_event_history_info`].
     pub async fn get_event_history(
         &self,
         params: GetEventHistoryParams,
     ) -> Result<Vec<EventHistory>> {
-        let params = serde_qs::to_string(&params).unwrap();
-        self.stream_get(&format!("history?{}", params)).await
+        self.rest
+            .get_with_params("history", params)
+            .await
+            .map_err(Into::into)
+    }
+
+}
+
+pub enum MevShareRequest {
+    SendPrivateTransaction,
+    SendBundle,
+    SimBundle,
+    GetUserStats,
+    GetBundleStats,
+}
+
+impl MevShareRequest {
+    pub fn as_method_name(&self) -> &str {
+        match &self {
+            Self::SendPrivateTransaction => "eth_sendPrivateTransaction",
+            Self::SendBundle => "mev_sendBundle",
+            Self::SimBundle => "mev_simBundle",
+            Self::GetUserStats => "flashbots_getUserStatsV2",
+            Self::GetBundleStats => "flashbots_getBundleStatsV2",
+        }
     }
 }

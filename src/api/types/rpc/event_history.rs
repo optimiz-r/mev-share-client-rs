@@ -1,52 +1,50 @@
 use super::super::Transaction;
-use derive_builder::{Builder, UninitializedFieldError};
 use ethers::prelude::*;
 use serde::{Deserialize, Serialize};
+use typed_builder::TypedBuilder;
 
-/// Data about the event history endpoint.
+/// MEV-Share API response from '/history/info'. See [`crate::MevShareClient::get_event_history_info`].
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::module_name_repetitions)]
 pub struct EventHistoryInfo {
-    pub min_block: U64,
-    pub max_block: U64,
-    pub min_timestamp: U64,
-    pub max_timestamp: U64,
+    pub min_block: u64,
+    pub max_block: u64,
+    pub min_timestamp: u64,
+    pub max_timestamp: u64,
     pub count: u32,
     pub max_limit: u32,
 }
 
-/// Arguments for the [`get_event_history`] function.
-#[derive(Clone, Serialize, Default, Builder, Debug)]
-#[builder(
-    default,
-    setter(strip_option),
-    build_fn(error = "UninitializedFieldError")
-)]
+/// MEV-Share API parameteres for requests to '/history'. See [`crate::MevShareClient::get_event_history`].
+#[derive(Clone, Serialize, Default, TypedBuilder, Debug)]
+#[builder(field_defaults(default, setter(strip_option),))]
 #[serde(rename_all = "camelCase")]
 pub struct GetEventHistoryParams {
-    pub block_start: Option<U64>,
-    pub block_end: Option<U64>,
-    pub timestamp_start: Option<U64>,
-    pub timestamp_end: Option<U64>,
+    pub block_start: Option<u64>,
+    pub block_end: Option<u64>,
+    pub timestamp_start: Option<u64>,
+    pub timestamp_end: Option<u64>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
 }
 
-/// Data about an event from the [`get_event_history`] function.
-#[derive(Serialize, Deserialize, Debug)]
+/// MEV-Share API return from '/history'. See [`crate::MevShareClient::get_event_history`].
+#[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct EventHistory {
-    pub block: U64,
-    pub timestamp: U64,
-    pub hint: Hint,
+    pub block: u64,
+    pub timestamp: u64,
+    pub hint: EventHint,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+/// See [`EventHistory::hint`].
+#[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct Hint {
+pub struct EventHint {
     pub txs: Option<Vec<Transaction>>,
     pub hash: H256,
     pub logs: Option<Vec<Log>>,
-    pub gas_used: U256,
-    pub mev_gas_price: U256,
+    pub gas_used: Option<U256>,
+    pub mev_gas_price: Option<U256>,
 }

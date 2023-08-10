@@ -1,208 +1,193 @@
 #![feature(lazy_cell)]
-#![feature(once_cell_try)]
+#![feature(let_chains)]
+#![feature(impl_trait_projections)]
 #![allow(dead_code)]
 
 use ethers::prelude::*;
-use ethers::types::transaction::eip2718::TypedTransaction;
-use ethers::utils::format_ether;
 use ethers::utils::keccak256;
-use mev_share_client::prelude::*;
+use ethers::utils::parse_ether;
+use eyre::Result;
+use mev_share_rs::prelude::*;
+use mev_share_rs::SendTransactionParams;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::Mutex;
-use sugars::hset;
+use tokio::sync::Mutex;
 use tokio::try_join;
-use utils::init_tracing;
-mod utils;
-use utils::{Config, Error, Result};
+use tracing::*;
 
-const NUM_TARGET_BLOCKS: u64 = 3;
+mod common;
+use common::{init_tracing, Config, MockTx, BUILDERS};
+
+const INCLUSION_BLOCKS: u64 = 10;
 
 /// Sends a tx on every block and backruns it with a simple example tx.
-///
-/// Continues until we land a backrun, then exits.
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
-    let (provider, sender_wallet, auth_wallet) = Config::from_env().await?.as_tuple();
-
-    let client = MevShareClient::new(auth_wallet.clone(), Network::Goerli);
-
-    // used for tracking txs we sent. we only want to backrun txs we sent.
-    let target_txs = HashSet::<ethers::types::TxHash>::new();
-
-    // prepare tasks dependencies
-    let client = Arc::new(client);
-    let target_txs = Arc::new(Mutex::new(target_txs));
-
-    // this task makes sure that there's at least a transaction that we can backrun on every block
-    let _send_tx_task = tokio::spawn({
-        let client = Arc::clone(&client);
-        let target_txs = Arc::clone(&target_txs);
-
-        async move {
-            let mut block_stream = provider.subscribe_blocks().await?;
-            while let Some(block) = block_stream.next().await {
-                if target_txs.lock()?.len() != 0 {
-                    continue;
-                }
-
-                let tx: TypedTransaction = Eip1559TransactionRequest::new().into(); // TODO: fill tx
-                let signed_tx = tx.rlp_signed(&sender_wallet.sign_transaction_sync(&tx)?);
-                let txhash = client
-                    .send_transaction(
-                        signed_tx,
-                        TransactionParams::builder()
-                            .max_block_number(block.number.unwrap() + NUM_TARGET_BLOCKS)
-                            .hints(hset![mev_share_client::TxHash, Calldata, Logs])
-                            .build()?,
-                    )
-                    .await?;
-                target_txs.lock()?.insert(txhash);
-                tracing::info!("sent tx: {txhash:?}");
-            }
-
-            Result::Ok(())
-        }
-    });
-
-    // this task listens the mev share server events for txs and backruns them
-    let _backrun_task = tokio::spawn({
-        let client = Arc::clone(&client);
-        let target_txs = Arc::clone(&target_txs);
-
-        async move {
-            tracing::info!("listening for transactions...");
-
-            let mut event_stream = client.subscribe(EventType::Transaction);
-            while let Some(event) = event_stream.next().await {
-                let pending_tx = event?.try_into()?;
-                let backrun_result = backrun(pending_tx, target_txs.clone()).await;
-
-                match backrun_result {
-                    Err(err) => tracing::error!("{err}"),
-                    Ok(_) => tracing::info!("backrun successful!"),
-                }
-            }
-
-            Result::Ok(())
-        }
-    });
-
-    // both tasks will run in parallel until user ctrl-c
-    tokio::signal::ctrl_c().await.unwrap();
+    let c = Config::from_env().await?;
+    Executor::new(c.provider.clone(), c.auth_wallet.clone())
+        .await?
+        .run()
+        .await?;
 
     Ok(())
 }
 
-/// Async handler which backruns an mev-share tx with another basic example tx.
-pub async fn backrun(
-    pending_tx: mev_share_client::PendingTransaction,
-    target_txs: Arc<Mutex<HashSet<ethers::types::TxHash>>>,
-) -> Result<()> {
-    // ignore txs we didn't send.
-    if !target_txs.lock()?.contains(&pending_tx.hash) {
-        return Ok(());
+struct Executor<'a> {
+    provider: Provider<Ws>,
+    client: MevShareClient<'a>,
+
+    // used for tracking txs we sent. we only want to backrun txs we sent.
+    target_txs: Arc<Mutex<HashSet<TxHash>>>,
+}
+
+impl<'a> Executor<'a> {
+    pub async fn new(provider: Provider<Ws>, auth_wallet: LocalWallet) -> Result<Self> {
+        Ok(Self {
+            client: MevShareClient::<'a>::new(auth_wallet, provider.clone()).await?,
+            provider,
+            target_txs: Default::default(),
+        })
     }
 
-    // for testing, this is fine. in prod, you'll want an abstraction that manages these
-    let (provider, sender_wallet, auth_wallet) = Config::from_env().await?.as_tuple();
+    pub async fn run(&self) -> Result<()> {
+        // wait for both tasks
+        try_join!(
+            // this task makes sure that there's at least a transaction that we can backrun on every block
+            self.send_tx_task(),
+            // this task listens MEV-Share events for txs and backruns them
+            self.backrun_task()
+        )?;
 
-    let client = MevShareClient::new(auth_wallet.clone(), Network::Goerli);
+        Ok(())
+    }
 
-    let (start_block, nonce, fees) = try_join!(
-        provider.get_block_number(),
-        provider.get_transaction_count(sender_wallet.address(), None),
-        provider.estimate_eip1559_fees(None),
-    )?;
+    #[instrument(skip_all)]
+    async fn send_tx_task(&self) -> Result<()> {
+        info!("listening for blocks");
 
-    // the transaction that will land immediately after the target, capturing the value that is left behind
-    let backrun_tx = {
-        let mut tx: TypedTransaction = Eip1559TransactionRequest::new()
-            .from(sender_wallet.address())
-            .to(sender_wallet.address())
-            .value(U256::zero())
-            .nonce(nonce)
-            .data(b"im backrunniiiiing") // send bundle w/ (basefee + 100)gwei gas fee
-            .max_fee_per_gas(fees.0)
-            .max_priority_fee_per_gas(fees.1)
-            .into();
-        tx.set_nonce(tx.nonce().unwrap() + U256::one()); // in this example, we're sending the target from the same wallet
-        tx.rlp_signed(&sender_wallet.sign_transaction_sync(&tx)?)
-    };
-    let backrun_txhash = keccak256(&backrun_tx);
+        let mut block_stream = self.provider.subscribe_blocks().await?;
 
-    // compose the bundle
-    let backrun_bundle = vec![
-        // the tx to backrun
-        Hash(pending_tx.hash),
-        // the backrun tx
-        Signed {
-            tx: backrun_tx,
-            can_revert: false,
-        },
-    ];
+        while let Some(block) = block_stream.next().await {
+            let block_number = block.number.unwrap();
+            debug!(number = ?block_number, "received block");
 
-    let backrun_request = SendBundleParams::builder()
-        .inclusion_block(start_block + 1)
-        .inclusion_max_block(start_block + 1 + NUM_TARGET_BLOCKS)
-        .body(backrun_bundle)
-        .build()?;
+            // hold the lock until the we can read the tx hash from the response:
+            // if the backrun_task receives it before we have time to check it here,
+            // it will think it's not a target and discard it
+            let mut target_txs = self.target_txs.lock().await;
 
-    tracing::info!("sending backrun bundles targeting next {NUM_TARGET_BLOCKS} blocks...");
-    dbg!(&backrun_request);
+            // if we have a tx we can backrun, don't bother creating more
+            if target_txs.len() != 0 {
+                continue;
+            }
 
-    let backrun_response = client.send_bundle(backrun_request.clone()).await;
-    dbg!(&backrun_response);
+            info!(?block_number, "sending tx");
 
-    // checks for inclusion of `backrun_txhash` in the next `NUM_TARGET_BLOCKS`
-    let mut blocks_subscription = provider.subscribe_blocks().await?;
-    while let Some(block) = blocks_subscription.next().await {
-        let block_number = block.number.unwrap();
+            let sent_tx = self
+                .client
+                .send_private_transaction(
+                    SendTransactionParams::builder()
+                        .tx(MockTx::default().data(b"plz backrun me").build().await?)
+                        .max_block_number(block_number + 1 + INCLUSION_BLOCKS)
+                        .preferences(None, Some(BUILDERS.clone()))
+                        .build(),
+                )
+                .await?;
 
-        if block_number > start_block + NUM_TARGET_BLOCKS {
-            target_txs.lock()?.remove(&pending_tx.hash);
-            return Err(Error::BackrunTxDropped(NUM_TARGET_BLOCKS));
+            info!(hash = ?sent_tx.hash, "sent tx");
+
+            target_txs.insert(sent_tx.hash);
         }
 
-        tracing::info!(
-            "tx {} waiting for block {}",
-            pending_tx.hash,
-            block.number.unwrap()
-        );
+        Ok(())
+    }
 
-        // check for inclusion of backrun tx in target block
-        let receipt = match provider.get_transaction_receipt(backrun_txhash).await? {
-            Some(receipt) => receipt,
-            None => continue, // not included yet
-        };
+    #[instrument(skip_all)]
+    async fn backrun_task(&self) -> Result<()> {
+        info!("listening for transactions");
 
-        let status = match receipt.status {
-            Some(status) => status,
-            None => continue, // not included yet
-        };
+        let mut mev_share_stream = self.client.subscribe_bundles();
 
-        if status != U64::one() {
-            return Err(Error::BackrunTxReverted(receipt));
+        while let Some(event) = mev_share_stream.next().await {
+            let bundle = event?; // upstream errors in event
+
+            if let Some((hash, hints, logs)) = bundle.as_transaction() {
+                debug!(?hash, ?hints, ?logs, "received transaction");
+
+                info_span!("tx", ?hash);
+
+                if self.target_txs.lock().await.contains(&hash) {
+                    info!("tx is backrunnable");
+
+                    self.backrun(hash).await?;
+                    info!("backrunned tx");
+
+                    self.target_txs.lock().await.remove(&hash);
+                }
+            } else {
+                debug!(?bundle, "received");
+            }
         }
 
-        tracing::info!("bundle included! (found tx {})", receipt.transaction_hash);
+        Ok(())
+    }
 
-        // simulate for funzies
-        let sim_result = client
-            .simulate_bundle(
-                backrun_request,
-                SimulateBundleParams::builder()
-                    .parent_block(receipt.block_number.unwrap() - 1)
-                    .build()?,
-            )
+    /// Async handler which backruns an mev-share tx with another basic example tx.
+    async fn backrun(&self, target_tx: TxHash) -> Result<()> {
+        // for testing, this is fine. in prod, you'll want an abstraction that manages these
+        let current_block = self.provider.get_block_number().await?;
+
+        // the transaction that will land immediately after the target, capturing the value that is left behind
+        let backrun_tx = MockTx::default()
+            .data(b"im backrunniiiiiiing")
+            .tip((parse_ether("0.0002")?, parse_ether("0.00002")?))
+            // tx has yet to land and only private relay knows about it:
+            // provider's nonce will have to be incremented by 1
+            .nonce_add(1)
+            .build()
             .await?;
 
-        tracing::info!("profit: {} ETH", format_ether(sim_result.profit));
+        debug!(
+            hash = ?TxHash::from(keccak256(&backrun_tx)),
+            "made backrun tx"
+        );
 
-        return Ok(());
+        let backrun_bundle_request = SendBundleParams::builder()
+            .inclusion(
+                current_block + 1,
+                Some(current_block + 1 + INCLUSION_BLOCKS),
+            )
+            .body(vec![
+                // the tx to backrun, from the MEV-Share SSE
+                Body::Tx { hash: target_tx },
+                // our backrun tx
+                Body::Signed {
+                    tx: backrun_tx,
+                    can_revert: false,
+                },
+            ])
+            // .validity(vec![], vec![])
+            .privacy(None, Some(BUILDERS.clone()))
+            .build();
+
+        info!("simulating backrun bundle");
+
+        info!(
+            params = %serde_json::to_string(&backrun_bundle_request).unwrap(),
+            "sending backrun bundle",
+        );
+
+        let pending_bundle = self
+            .client
+            .send_bundle(backrun_bundle_request.clone())
+            .await?;
+
+        info!(hash = ?pending_bundle.hash, "bundle accepted by the relayer, waiting for landing");
+
+        pending_bundle.inclusion().await?;
+
+        Ok(())
     }
-
-    Ok(())
 }

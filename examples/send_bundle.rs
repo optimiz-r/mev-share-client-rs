@@ -1,82 +1,89 @@
 #![feature(lazy_cell)]
-#![feature(once_cell_try)]
-#![feature(const_trait_impl)]
+#![feature(let_chains)]
+#![feature(array_try_map)]
 #![allow(dead_code)]
 
 /// Sends a bundle that shares as much data as possible by setting the `privacy` param.
 use ethers::prelude::*;
-use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::utils::parse_ether;
-use mev_share_client::prelude::*;
-use mev_share_client::MevShareClient;
-use sugars::hset;
-use tokio::try_join;
+use eyre::{eyre, Result};
+use mev_share_rs::prelude::*;
+use mev_share_rs::MevShareClient;
+use tracing::*;
 
-mod utils;
-use utils::{init_tracing, Config, Error, Result};
-
-const NUM_TARGET_BLOCKS: u64 = 3;
+mod common;
+use common::{init_tracing, Config, MockTx, BUILDERS};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
     // load config
-    let (provider, sender_wallet, auth_wallet) = Config::from_env().await?.as_tuple();
-    let client = MevShareClient::new(auth_wallet.clone(), Network::Goerli);
+    let c = Config::from_env().await?;
+    let client = MevShareClient::new(c.auth_wallet.clone(), c.provider.clone()).await?;
 
-    let (chain_id, fees, transaction_count, current_block) = try_join!(
-        provider.get_chainid(),
-        provider.estimate_eip1559_fees(None),
-        provider.get_transaction_count(sender_wallet.address(), None),
-        provider.get_block_number()
-    )?;
-    dbg!(&fees);
+    let current_block = c.provider.get_block_number().await?;
 
     /*
         NOTE: only bundles comprised solely of signed transactions are supported at the moment.
         Bundles containing `hash` cannot set `privacy` settings.
     */
 
-    let bundle = {
-        let tx = {
-            let tip = parse_ether("0.0002").map_err(Error::ParseEther)?;
-            let tx: TypedTransaction = Eip1559TransactionRequest::new()
-                .chain_id(chain_id.as_u64())
-                .from(sender_wallet.address())
-                .to(sender_wallet.address())
-                .nonce(transaction_count)
-                .max_fee_per_gas(fees.0 + tip)
-                .max_priority_fee_per_gas(fees.1 + tip)
-                .into();
-            tx.rlp_signed(&sender_wallet.sign_transaction_sync(&tx)?)
-        };
+    let tip = (parse_ether("0.0002")?, parse_ether("0.00002")?);
 
-        vec![Body::Signed {
-            tx,
-            can_revert: false,
-        }]
-    };
-
-    tracing::info!("Sending bundle targeting next {NUM_TARGET_BLOCKS} blocks...");
-
-    let request_params = SendBundleParams::builder()
-        .inclusion_block(current_block + 1)
-        .inclusion_max_block(current_block + 1 + NUM_TARGET_BLOCKS)
-        .body(bundle)
-        .privacy_hints(hset![
-            mev_share_client::TxHash,
-            Calldata,
-            Logs,
-            FunctionSelector,
-            ContractAddress
+    let bundle_request = SendBundleParams::builder()
+        .body(vec![
+            Body::Signed {
+                tx: MockTx::default().tip(tip).build().await?,
+                can_revert: false,
+            },
+            Body::Signed {
+                tx: MockTx::default().tip(tip).nonce_add(1).build().await?,
+                can_revert: false,
+            },
         ])
-        .privacy_builders(vec!["flashbots".to_string()])
-        .build()?;
-    dbg!(&request_params);
+        .inclusion(current_block + 1, Some(current_block + 1 + 20))
+        .privacy(
+            // what to disclose
+            Some(set![
+                Hint::TxHash,
+                Calldata,
+                Logs,
+                FunctionSelector,
+                ContractAddress
+            ]),
+            // to whom
+            Some(BUILDERS.clone()),
+        )
+        .build();
 
-    let backrun_result = client.send_bundle(request_params).await;
-    dbg!(&backrun_result);
+    // before submission, make sure simulation is ok
+    // sending several reverting bundles may lead to our `auth_signer` losing high priority status
+    // see: https://docs.flashbots.net/flashbots-auction/searchers/advanced/reputation
+    let simulation = client
+        .simulate_bundle(
+            bundle_request.clone(),
+            SimulateBundleParams::builder()
+                .parent_block(current_block)
+                .build(),
+        )
+        .await?;
+
+    if !simulation.success {
+        // abort
+        return Err(eyre!("simulation failure: {simulation:?}"));
+    }
+
+    debug!(?simulation, "successful simulation");
+
+    // send the bundle to the Flashbots MEV-Share relayer
+    let pending_bundle = client.send_bundle(bundle_request).await?;
+    let bundle_hash = pending_bundle.hash;
+    info!(?bundle_hash, "bundle accepted by the relayer");
+
+    // wait for the bundle to land
+    pending_bundle.inclusion().await?;
+    info!(?bundle_hash, "bundle landed on-chain");
 
     Ok(())
 }

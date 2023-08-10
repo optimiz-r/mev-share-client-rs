@@ -1,8 +1,7 @@
-use ethers::types::Chain;
+use ethers::types::{Chain, U256};
 
 #[derive(Debug, Clone)]
 pub struct MevShareNetwork {
-    // pub name: &'static str,
     pub chain: Chain,
     pub stream_url: &'static str,
     pub api_url: &'static str,
@@ -20,16 +19,21 @@ const GOERLI: MevShareNetwork = MevShareNetwork {
     api_url: "https://relay-goerli.flashbots.net",
 };
 
-pub enum Network {
-    Mainnet,
-    Goerli,
-}
+// const SEPOLIA: MevShareNetwork = MevShareNetwork {
+//     chain: Chain::Sepolia,
+//     stream_url: "NOT AVAILABLE YET",
+//     api_url: "https://relay-sepolia.flashbots.net",
+// };
 
-impl From<Network> for MevShareNetwork {
-    fn from(value: Network) -> Self {
-        match value {
-            Network::Mainnet => MAINNET,
-            Network::Goerli => GOERLI,
+impl TryFrom<U256> for MevShareNetwork {
+    type Error = crate::Error;
+
+    fn try_from(chain: U256) -> Result<Self, Self::Error> {
+        match chain.as_u64() {
+            1 => Ok(MAINNET),
+            5 => Ok(GOERLI),
+            // 11_155_111 => Ok(SEPOLIA),
+            _ => Err(crate::Error::UnsupportedNetwork(chain)),
         }
     }
 }
