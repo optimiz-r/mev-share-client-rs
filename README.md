@@ -12,7 +12,7 @@ In `Cargo.toml`:
 
 ```toml
 [dependencies]
-mev_share_rs = "0.2.0"
+mev_share_rs = "0.1.0"
 ```
 
 ### Client initialization
@@ -264,11 +264,12 @@ This project is licensed under the [MIT License]
 [`paradigm/mev-share-rs`]: https://github.com/paradigmxyz/mev-share-rs
 
 <!-- docs -->
-[`Signer`]: ethers::signers::Signer
-[`LocalWallet`]: ethers::signers::LocalWallet
-[`Provider`]: ethers::providers::Provider
-[`get_event_history`]: MevShareClient::get_event_history
-[`get_event_history_info`]: MevShareClient::get_event_history_info
+[`Signer`]: https://github.com/gakonst/ethers-rs/blob/5145992e4b03fdaebcc4d35aa7ee44504ca82b5a/ethers-signers/src/lib.rs#L59
+[`LocalWallet`]: https://github.com/gakonst/ethers-rs/blob/5145992e4b03fdaebcc4d35aa7ee44504ca82b5a/ethers-signers/src/lib.rs#L12
+[`Provider`]: https://github.com/gakonst/ethers-rs/blob/5145992e4b03fdaebcc4d35aa7ee44504ca82b5a/ethers-providers/src/rpc/provider.rs
+[`Result`]: https://github.com/optimiz-r/mev-share-client-rs/blob/bf5e6783de4c2659c17b9e547cc6fae52dbb3822/src/error.rs#L109
+[`get_event_history`]: https://github.com/optimiz-r/mev-share-client-rs/blob/bf5e6783de4c2659c17b9e547cc6fae52dbb3822/src/client.rs#L389
+[`get_event_history_info`]: https://github.com/optimiz-r/mev-share-client-rs/blob/bf5e6783de4c2659c17b9e547cc6fae52dbb3822/src/client.rs#L371
 [`mev_sendBundle`]: https://docs.flashbots.net/flashbots-auction/searchers/advanced/rpc-endpoint#mev_sendbundle
 [`mev_simBundle`]: https://docs.flashbots.net/flashbots-auction/searchers/advanced/rpc-endpoint#mev_simbundle
 [`eth_sendBundle`]: https://docs.flashbots.net/flashbots-auction/searchers/advanced/rpc-endpoint#eth_sendbundle
